@@ -16,25 +16,25 @@ from boto.ec2.regioninfo import RegionInfo
 import logging
 log = logging.getLogger( __name__ )
 
-class EucalyptusCloudProvider( object ):
+class EC2CloudProvider( object ):
     """
-    Eucalyptus-based cloud provider implementation for managing instances. 
+    Amazon EC2-based cloud provider implementation for managing instances. 
     """
     STOP_SIGNAL = object()
     def __init__( self, app ):
-        self.zone = "epc"
+        self.zone = "us-east-1a"
         self.key_pair = "galaxy-keypair"
         self.queue = Queue()
         
         #TODO: Use multiple threads to process requests?
         self.threads = []
         nworkers = 5
-        log.info( "Starting eucalyptus cloud controller workers" )
+        log.info( "Starting EC2 cloud controller workers" )
         for i in range( nworkers  ):
             worker = threading.Thread( target=self.run_next )
             worker.start()
             self.threads.append( worker )
-        log.debug( "%d eucalyptus cloud workers ready", nworkers )
+        log.debug( "%d EC2 cloud workers ready", nworkers )
         
     def run_next( self ):
         """Run the next job, waiting until one is available if necessary"""
@@ -64,13 +64,10 @@ class EucalyptusCloudProvider( object ):
             
     def get_connection( self, uci_wrapper ):
         """
-        Establishes eucalyptus cloud connection using user's credentials associated with given UCI
+        Establishes EC2 cloud connection using user's credentials associated with given UCI
         """
-        log.debug( '##### Establishing eucalyptus cloud connection' )
-        # Eucalyptus Public Cloud
-        # TODO: Add option in Galaxy config file to specify these values (i.e., for locally managed Eucalyptus deployments)
-        euca_region = RegionInfo( None, "eucalyptus", "mayhem9.cs.ucsb.edu" )
-        conn = EC2Connection( aws_access_key_id=uci_wrapper.get_access_key(), aws_secret_access_key=uci_wrapper.get_secret_key(), is_secure=False, port=8773, region=euca_region, path="/services/Eucalyptus" )
+        log.debug( '##### Establishing EC2 cloud connection' )
+        conn = EC2Connection( uci_wrapper.get_access_key(), uci_wrapper.get_secret_key() )
         return conn
         
     def set_keypair( self, uci_wrapper, conn ):
@@ -100,7 +97,7 @@ class EucalyptusCloudProvider( object ):
         TODO: Dummy method - need to implement logic
             For valid sizes, see http://aws.amazon.com/ec2/instance-types/
         """
-        return model.CloudImage.filter( model.CloudImage.table.c.id==1 ).first().image_id 
+        return model.CloudImage.filter( model.CloudImage.table.c.id==2 ).first().image_id 
     
 #    def get_instances( self, uci ):
 #        """
@@ -119,10 +116,10 @@ class EucalyptusCloudProvider( object ):
         
     def shutdown( self ):
         """Attempts to gracefully shut down the monitor thread"""
-        log.info( "sending stop signal to worker threads in eucalyptus cloud manager" )
+        log.info( "sending stop signal to worker threads in EC2 cloud manager" )
         for i in range( len( self.threads ) ):
             self.queue.put( self.STOP_SIGNAL )
-        log.info( "eucalyptus cloud manager stopped" )
+        log.info( "EC2 cloud manager stopped" )
     
     def put( self, uci_wrapper ):
         # Get rid of UCI from state description
@@ -146,11 +143,23 @@ class EucalyptusCloudProvider( object ):
         # Because only 1 storage volume may be created at UCI config time, index of this storage volume in local Galaxy DB w.r.t
         # current UCI is 0, so reference it in following methods
         vol = conn.create_volume( uci_wrapper.get_store_size( 0 ), uci_wrapper.get_uci_availability_zone(), snapshot=None )
-        uci_wrapper.set_store_volume_id( 0, vol.id ) 
+        uci_wrapper.set_store_volume_id( 0, vol.id )
         
-        # EPC does not allow creation of storage volumes (it deletes one as soon as it is created, so manually set uci_state here)
+        # Wait for a while to ensure volume was created
+        vol_status = vol.status
+        for i in range( 30 ):
+            if vol_status is not "available":
+                log.debug( 'Updating volume status; current status: %s' % vol_status )
+                vol_status = vol.status
+                time.sleep(3)
+            if i is 29:
+                log.debug( "Error while creating volume '%s'; stuck in state '%s'; deleting volume." % ( vol.id, vol_status ) )
+                conn.delete_volume( vol.id )
+                uci_wrapper.change_state( uci_state='error' )
+                return
+        
         uci_wrapper.change_state( uci_state='available' )
-        uci_wrapper.set_store_status( vol.id, vol.status )
+        uci_wrapper.set_store_status( vol.id, vol_status )
 
     def deleteUCI( self, uci_wrapper ):
         """ 
@@ -185,7 +194,8 @@ class EucalyptusCloudProvider( object ):
             uci_wrapper.change_state( uci_state="error" )
             
     def addStorageToUCI( self, name ):
-        """ Adds more storage to specified UCI """
+        """ Adds more storage to specified UCI 
+        TODO"""
     
     def dummyStartUCI( self, uci_wrapper ):
         
@@ -203,41 +213,46 @@ class EucalyptusCloudProvider( object ):
         conn = self.get_connection( uci_wrapper )
 #        
         self.set_keypair( uci_wrapper, conn )
-        
-        i_indexes = uci_wrapper.get_instances_indexes() # Get indexes of i_indexes associated with this UCI
+        i_indexes = uci_wrapper.get_instances_indexes() # Get indexes of *new* i_indexes associated with this UCI
+        log.debug( "Starting instances with IDs: '%s' associated with UCI '%s' " % ( uci_wrapper.get_name(), i_indexes ) )
         
         for i_index in i_indexes:
             mi_id = self.get_mi_id( uci_wrapper.get_type( i_index ) )
             log.debug( "mi_id: %s, uci_wrapper.get_key_pair_name( i_index ): %s" % ( mi_id, uci_wrapper.get_key_pair_name( i_index ) ) )
             uci_wrapper.set_mi( i_index, mi_id )
             
-    #            log.debug( '***** Setting up security group' )
-                # If not existent, setup galaxy security group
-    #            try:
-    #                gSecurityGroup = conn.create_security_group('galaxy', 'Security group for Galaxy.')
-    #                gSecurityGroup.authorize( 'tcp', 80, 80, '0.0.0.0/0' ) # Open HTTP port
-    #                gSecurityGroup.authorize( 'tcp', 22, 22, '0.0.0.0/0' ) # Open SSH port
-    #            except:
-    #                pass
-    #                sgs = conn.get_all_security_groups()
-    #                for i in range( len( sgs ) ):
-    #                    if sgs[i].name == "galaxy":
-    #                        sg.append( sgs[i] )
-    #                        break # only 1 security group w/ this name can exist, so continue                    
-                
+            # Check if galaxy security group exists (and create it if it does not)
+            log.debug( '***** Setting up security group' )
+            security_group = 'galaxyWeb'
+            sgs = conn.get_all_security_groups() # security groups
+            gsgt = False # galaxy security group test
+            for sg in sgs:
+                if sg.name == security_group:
+                    gsgt = True
+            # If security group does not exist, create it 
+            if not gsgt:
+                gSecurityGroup = conn.create_security_group(security_group, 'Security group for Galaxy.')
+                gSecurityGroup.authorize( 'tcp', 80, 80, '0.0.0.0/0' ) # Open HTTP port
+                gSecurityGroup.authorize( 'tcp', 22, 22, '0.0.0.0/0' ) # Open SSH port
+            # Start an instance            
             log.debug( "***** Starting UCI instance '%s'" % uci_wrapper.get_name() )
-            log.debug( 'Using following command: conn.run_instances( image_id=%s, key_name=%s )' % ( mi_id, uci_wrapper.get_key_pair_name( i_index ) ) )
-            reservation = conn.run_instances( image_id=mi_id, key_name=uci_wrapper.get_key_pair_name( i_index ) )
-            #reservation = conn.run_instances( image_id=instance.image, key_name=instance.keypair_name, security_groups=['galaxy'], instance_type=instance.type,  placement=instance.availability_zone )
+            log.debug( 'Using following command: conn.run_instances( image_id=%s, key_name=%s, security_groups=[%s], instance_type=%s, placement=%s )' 
+                       % ( mi_id, uci_wrapper.get_key_pair_name( i_index ), [security_group], uci_wrapper.get_type( i_index ), uci_wrapper.get_uci_availability_zone() ) )
+            reservation = conn.run_instances( image_id=mi_id, 
+                                              key_name=uci_wrapper.get_key_pair_name( i_index ), 
+                                              security_groups=[security_group], 
+                                              instance_type=uci_wrapper.get_type( i_index ),  
+                                              placement=uci_wrapper.get_uci_availability_zone() )
+            # Record newly available instance data into local Galaxy database
             l_time = datetime.utcnow()
             uci_wrapper.set_launch_time( l_time, i_index=i_index ) # format_time( reservation.i_indexes[0].launch_time ) )
             if not uci_wrapper.uci_launch_time_set():
                 uci_wrapper.set_uci_launch_time( l_time )
             uci_wrapper.set_reservation_id( i_index, str( reservation ).split(":")[1] )
             # TODO: if more than a single instance will be started through single reservation, change this reference to element [0]
-            i_id = str( reservation.instances[0]).split(":")[1]
+            i_id = str( reservation.instances[0]).split(":")[1] 
             uci_wrapper.set_instance_id( i_index, i_id )
-            s = reservation.instances[0].state
+            s = reservation.instances[0].state 
             uci_wrapper.change_state( s, i_id, s )
             log.debug( "Instance of UCI '%s' started, current state: %s" % ( uci_wrapper.get_name(), uci_wrapper.get_state() ) )
         
@@ -397,8 +412,7 @@ class EucalyptusCloudProvider( object ):
         a_key = uci.credentials.access_key
         s_key = uci.credentials.secret_key
         # Get connection
-        euca_region = RegionInfo( None, "eucalyptus", "mayhem9.cs.ucsb.edu" )
-        conn = EC2Connection( aws_access_key_id=a_key, aws_secret_access_key=s_key, is_secure=False, port=8773, region=euca_region, path="/services/Eucalyptus" )
+        conn = EC2Connection( aws_access_key_id=a_key, aws_secret_access_key=s_key )
         # Get reservations handle for given instance
         rl= conn.get_all_instances( [inst.instance_id] )
         # Because EPC deletes references to reservations after a short while after instances have terminated, getting an empty list as a response to a query
@@ -441,8 +455,7 @@ class EucalyptusCloudProvider( object ):
         a_key = uci.credentials.access_key
         s_key = uci.credentials.secret_key
         # Get connection
-        euca_region = RegionInfo( None, "eucalyptus", "mayhem9.cs.ucsb.edu" )
-        conn = EC2Connection( aws_access_key_id=a_key, aws_secret_access_key=s_key, is_secure=False, port=8773, region=euca_region, path="/services/Eucalyptus" )
+        conn = EC2Connection( aws_access_key_id=a_key, aws_secret_access_key=s_key )
         # Get reservations handle for given store 
         vl = conn.get_all_volumes( [store.volume_id] )
 #        log.debug( "Store '%s' vl: '%s'" % ( store.volume_id, vl ) )
@@ -460,48 +473,48 @@ class EucalyptusCloudProvider( object ):
             store.device = vl[0].device
             store.flush()
     
-    def updateUCI( self, uci ):
-        """ 
-        Runs a global status update on all storage volumes and all instances that are
-        associated with specified UCI
-        """
-        conn = self.get_connection( uci )
-        
-        # Update status of storage volumes
-        vl = model.CloudStore.filter( model.CloudInstance.c.uci_id == uci.id ).all()
-        vols = []
-        for v in vl:
-            vols.append( v.volume_id )
-        try:
-            volumes = conn.get_all_volumes( vols )
-            for i, v in enumerate( volumes ):
-                uci.store[i].i_id = v.instance_id
-                uci.store[i].status = v.status
-                uci.store[i].device = v.device
-                uci.store[i].flush()
-        except:
-            log.debug( "Error updating status of volume(s) associated with UCI '%s'. Status was not updated." % uci.name )
-            pass
-        
-        # Update status of instances
-        il = model.CloudInstance.filter_by( uci_id=uci.id ).filter( model.CloudInstance.c.state != 'terminated' ).all()
-        instanceList = []
-        for i in il:
-            instanceList.append( i.instance_id )
-        log.debug( 'instanceList: %s' % instanceList )
-        try:
-            reservations = conn.get_all_instances( instanceList )
-            for i, r in enumerate( reservations ):
-                uci.instance[i].state = r.instances[0].update()
-                log.debug('updating instance %s; status: %s' % ( uci.instance[i].instance_id, uci.instance[i].state ) )
-                uci.state = uci.instance[i].state
-                uci.instance[i].public_dns = r.instances[0].dns_name
-                uci.instance[i].private_dns = r.instances[0].private_dns_name
-                uci.instance[i].flush()
-                uci.flush()
-        except:
-            log.debug( "Error updating status of instances associated with UCI '%s'. Instance status was not updated." % uci.name )
-            pass
+#    def updateUCI( self, uci ):
+#        """ 
+#        Runs a global status update on all storage volumes and all instances that are
+#        associated with specified UCI
+#        """
+#        conn = self.get_connection( uci )
+#        
+#        # Update status of storage volumes
+#        vl = model.CloudStore.filter( model.CloudInstance.c.uci_id == uci.id ).all()
+#        vols = []
+#        for v in vl:
+#            vols.append( v.volume_id )
+#        try:
+#            volumes = conn.get_all_volumes( vols )
+#            for i, v in enumerate( volumes ):
+#                uci.store[i].i_id = v.instance_id
+#                uci.store[i].status = v.status
+#                uci.store[i].device = v.device
+#                uci.store[i].flush()
+#        except:
+#            log.debug( "Error updating status of volume(s) associated with UCI '%s'. Status was not updated." % uci.name )
+#            pass
+#        
+#        # Update status of instances
+#        il = model.CloudInstance.filter_by( uci_id=uci.id ).filter( model.CloudInstance.c.state != 'terminated' ).all()
+#        instanceList = []
+#        for i in il:
+#            instanceList.append( i.instance_id )
+#        log.debug( 'instanceList: %s' % instanceList )
+#        try:
+#            reservations = conn.get_all_instances( instanceList )
+#            for i, r in enumerate( reservations ):
+#                uci.instance[i].state = r.instances[0].update()
+#                log.debug('updating instance %s; status: %s' % ( uci.instance[i].instance_id, uci.instance[i].state ) )
+#                uci.state = uci.instance[i].state
+#                uci.instance[i].public_dns = r.instances[0].dns_name
+#                uci.instance[i].private_dns = r.instances[0].private_dns_name
+#                uci.instance[i].flush()
+#                uci.flush()
+#        except:
+#            log.debug( "Error updating status of instances associated with UCI '%s'. Instance status was not updated." % uci.name )
+#            pass
         
     # --------- Helper methods ------------
     
