@@ -1,24 +1,23 @@
-from sqlalchemy.types import *
-
-import json
-import pickle
-import copy
-import uuid
 import binascii
-from galaxy.util.bunch import Bunch
-from galaxy.util.aliaspickler import AliasPickleModule
-
-# For monkeypatching BIGINT
-import sqlalchemy.dialects.sqlite
-import sqlalchemy.dialects.postgresql
-import sqlalchemy.dialects.mysql
-
+import copy
+import json
 import logging
+import uuid
+
+from galaxy import eggs
+eggs.require("SQLAlchemy")
+import sqlalchemy
+
+from galaxy.util.aliaspickler import AliasPickleModule
+from sqlalchemy.types import CHAR, LargeBinary, String, TypeDecorator
+from sqlalchemy.ext.mutable import Mutable
+
 log = logging.getLogger( __name__ )
 
 # Default JSON encoder and decoder
 json_encoder = json.JSONEncoder( sort_keys=True )
 json_decoder = json.JSONDecoder( )
+
 
 def _sniffnfix_pg9_hex(value):
     """
@@ -31,8 +30,43 @@ def _sniffnfix_pg9_hex(value):
             return binascii.unhexlify( value[2:] )
         else:
             return value
-    except Exception, ex:
+    except Exception:
         return value
+
+
+class MutableDict(Mutable, dict):
+    # MutableDict following http://docs.sqlalchemy.org/en/latest/orm/extensions/mutable.html
+    @classmethod
+    def coerce(cls, key, value):
+        "Convert plain dictionaries to MutableDict."
+
+        if not isinstance(value, MutableDict):
+            if isinstance(value, dict):
+                return MutableDict(value)
+
+            # this call will raise ValueError
+            return Mutable.coerce(key, value)
+        else:
+            return value
+
+    def __setitem__(self, key, value):
+        "Detect dictionary set events and emit change events."
+
+        dict.__setitem__(self, key, value)
+        self.changed()
+
+    def __delitem__(self, key):
+        "Detect dictionary del events and emit change events."
+
+        dict.__delitem__(self, key)
+        self.changed()
+
+    def __getstate__(self):
+        return dict(self)
+
+    def __setstate__(self, state):
+        self.update(state)
+
 
 class JSONType( TypeDecorator ):
     """
@@ -62,9 +96,6 @@ class JSONType( TypeDecorator ):
         # return json_encoder.encode( x ) == json_encoder.encode( y )
         return ( x == y )
 
-    def is_mutable( self ):
-        return True
-
     def load_dialect_impl(self, dialect):
         if dialect.name == "mysql":
             return dialect.type_descriptor(sqlalchemy.dialects.mysql.MEDIUMBLOB)
@@ -72,9 +103,13 @@ class JSONType( TypeDecorator ):
             return self.impl
 
 
+MutableDict.associate_with(JSONType)
+
+
 metadata_pickler = AliasPickleModule( {
-    ( "cookbook.patterns", "Bunch" ) : ( "galaxy.util.bunch" , "Bunch" )
+    ( "cookbook.patterns", "Bunch" ): ( "galaxy.util.bunch", "Bunch" )
 } )
+
 
 class MetadataType( JSONType ):
     """
@@ -95,6 +130,7 @@ class MetadataType( JSONType ):
             except:
                 ret = None
         return ret
+
 
 class UUIDType(TypeDecorator):
     """
@@ -129,31 +165,9 @@ class UUIDType(TypeDecorator):
 
 class TrimmedString( TypeDecorator ):
     impl = String
+
     def process_bind_param( self, value, dialect ):
         """Automatically truncate string values"""
         if self.impl.length and value is not None:
             value = value[0:self.impl.length]
         return value
-
-
-#class BigInteger( Integer ):
-    #"""
-    #A type for bigger ``int`` integers.
-
-    #Typically generates a ``BIGINT`` in DDL, and otherwise acts like
-    #a normal :class:`Integer` on the Python side.
-
-    #"""
-
-#class BIGINT( BigInteger ):
-    #"""The SQL BIGINT type."""
-
-#class SLBigInteger( BigInteger ):
-    #def get_col_spec( self ):
-        #return "BIGINT"
-
-#sqlalchemy.dialects.sqlite.SLBigInteger = SLBigInteger
-#sqlalchemy.dialects.sqlite.colspecs[BigInteger] = SLBigInteger
-#sqlalchemy.dialects.sqlite.ischema_names['BIGINT'] = SLBigInteger
-#sqlalchemy.dialects.postgres.colspecs[BigInteger] = sqlalchemy.dialects.postgres.PGBigInteger
-#sqlalchemy.dialects.mysql.colspecs[BigInteger] = sqlalchemy.dialects.mysql.MSBigInteger
